@@ -17,19 +17,15 @@ ENCODER_DEFAULT_LR = {
         'bert-base-cased': 1e-4,
         'bert-large-cased': 1e-4,
         'roberta-large': 1e-5,
-    },
-    'medqa_usmle': {
-        'cambridgeltl/SapBERT-from-PubMedBERT-fulltext': 5e-5,
-    },
+    }
 }
 
-DATASET_LIST = ['csqa', 'obqa', 'socialiqa', 'medqa_usmle']
+DATASET_LIST = ['csqa', 'obqa', 'socialiqa']
 
 DATASET_SETTING = {
     'csqa': 'inhouse',
     'obqa': 'official',
     'socialiqa': 'official',
-    'medqa_usmle': 'official',
 }
 
 DATASET_NO_TEST = ['socialiqa']
@@ -39,13 +35,13 @@ EMB_PATHS = {
     'lm': 'data/transe/glove.transe.sgd.ent.npy',
     'numberbatch': 'data/transe/concept.nb.npy',
     'tzw': 'data/cpnet/tzw.ent.npy',
-    'ddb': 'data/ddb/ent_emb.npy',
 }
 
 
 def add_data_arguments(parser):
     # arguments that all datasets share
-    parser.add_argument('--ent_emb', default=['tzw'], nargs='+', help='sources for entity embeddings')
+    parser.add_argument('--ent_emb', default=['tzw'], choices=['tzw'], nargs='+', help='sources for entity embeddings')
+    parser.add_argument('--ent_emb_paths', default=['data/cpnet/tzw.ent.npy'], nargs='+', help='paths to entity embedding file(s)')
     # dataset specific
     parser.add_argument('-ds', '--dataset', default='csqa', choices=DATASET_LIST, help='dataset name')
     parser.add_argument('-ih', '--inhouse', type=bool_flag, nargs='?', const=True, help='run in-house setting')
@@ -95,6 +91,7 @@ def add_additional_arguments(parser):
     parser.add_argument('--cuda', default=True, type=bool_flag, nargs='?', const=True, help='use GPU')
     parser.add_argument('--seed', default=0, type=int, help='random seed')
     parser.add_argument('--debug', default=False, type=bool_flag, nargs='?', const=True, help='run in debug mode')
+    parser.add_argument('--kb', type=str, default="conceptnet", help='Name of the knowledge base')
     args, _ = parser.parse_known_args()
     if args.debug:
         parser.set_defaults(batch_size=1, log_interval=1, eval_interval=5)

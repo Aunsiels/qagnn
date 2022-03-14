@@ -1,4 +1,5 @@
 import random
+import torch
 
 try:
     from transformers import (ConstantLRSchedule, WarmupLinearSchedule, WarmupConstantSchedule)
@@ -13,7 +14,6 @@ from utils.parser_utils import *
 DECODER_DEFAULT_LR = {
     'csqa': 1e-3,
     'obqa': 3e-4,
-    'medqa_usmle': 1e-3,
 }
 
 from collections import defaultdict, OrderedDict
@@ -22,7 +22,6 @@ import numpy as np
 import socket, os, subprocess, datetime
 print(socket.gethostname())
 print ("pid:", os.getpid())
-print ("conda env:", os.environ['CONDA_DEFAULT_ENV'])
 print ("screen: %s" % subprocess.check_output('echo $STY', shell=True).decode('utf'))
 print ("gpu: %s" % subprocess.check_output('echo $CUDA_VISIBLE_DEVICES', shell=True).decode('utf'))
 
@@ -31,7 +30,7 @@ def evaluate_accuracy(eval_set, model):
     n_samples, n_correct = 0, 0
     model.eval()
     with torch.no_grad():
-        for qids, labels, *input_data in tqdm(eval_set):
+        for qids, labels, *input_data in eval_set:
             logits, _ = model(*input_data)
             n_correct += (logits.argmax(1) == labels).sum().item()
             n_samples += labels.size(0)
@@ -49,9 +48,9 @@ def main():
 
     # data
     parser.add_argument('--num_relation', default=38, type=int, help='number of relations')
-    parser.add_argument('--train_adj', default=f'data/{args.dataset}/graph/train.graph.adj.pk')
-    parser.add_argument('--dev_adj', default=f'data/{args.dataset}/graph/dev.graph.adj.pk')
-    parser.add_argument('--test_adj', default=f'data/{args.dataset}/graph/test.graph.adj.pk')
+    parser.add_argument('--train_adj', default=f'data/{args.dataset}_{args.kb}/graph/train.graph.adj.pk')
+    parser.add_argument('--dev_adj', default=f'data/{args.dataset}_{args.kb}/graph/dev.graph.adj.pk')
+    parser.add_argument('--test_adj', default=f'data/{args.dataset}_{args.kb}/graph/test.graph.adj.pk')
     parser.add_argument('--use_cache', default=True, type=bool_flag, nargs='?', const=True, help='use cached data to accelerate data loading')
 
     # model architecture
@@ -79,16 +78,12 @@ def main():
     parser.add_argument('-ebs', '--eval_batch_size', default=2, type=int)
     parser.add_argument('--unfreeze_epoch', default=4, type=int)
     parser.add_argument('--refreeze_epoch', default=10000, type=int)
-    parser.add_argument('--fp16', default=False, type=bool_flag, help='use fp16 training. this requires torch>=1.6.0')
-    parser.add_argument('--drop_partial_batch', default=False, type=bool_flag, help='')
-    parser.add_argument('--fill_partial_batch', default=False, type=bool_flag, help='')
 
     parser.add_argument('-h', '--help', action='help', default=argparse.SUPPRESS, help='show this help message and exit')
     args = parser.parse_args()
     if args.simple:
         parser.set_defaults(k=1)
     args = parser.parse_args()
-    args.fp16 = args.fp16 and (torch.__version__ >= '1.6.0')
 
     if args.mode == 'train':
         train(args)
@@ -151,7 +146,7 @@ def train(args):
         ###################################################################################################
         #   Build model                                                                                   #
         ###################################################################################################
-        print ('args.num_relation', args.num_relation)
+
         model = LM_QAGNN(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
                                    concept_dim=args.gnn_dim,
                                    concept_in_dim=concept_dim,
@@ -160,11 +155,6 @@ def train(args):
                                    pretrained_concept_emb=cp_emb, freeze_ent_emb=args.freeze_ent_emb,
                                    init_range=args.init_range,
                                    encoder_config={})
-        if args.load_model_path:
-            print (f'loading and initializing model from {args.load_model_path}')
-            model_state_dict, old_args = torch.load(args.load_model_path, map_location=torch.device('cpu'))
-            model.load_state_dict(model_state_dict)
-
         model.encoder.to(device0)
         model.decoder.to(device1)
 
@@ -210,29 +200,12 @@ def train(args):
     elif args.loss == 'cross_entropy':
         loss_func = nn.CrossEntropyLoss(reduction='mean')
 
-    def compute_loss(logits, labels):
-        if args.loss == 'margin_rank':
-            num_choice = logits.size(1)
-            flat_logits = logits.view(-1)
-            correct_mask = F.one_hot(labels, num_classes=num_choice).view(-1)  # of length batch_size*num_choice
-            correct_logits = flat_logits[correct_mask == 1].contiguous().view(-1, 1).expand(-1, num_choice - 1).contiguous().view(-1)  # of length batch_size*(num_choice-1)
-            wrong_logits = flat_logits[correct_mask == 0]
-            y = wrong_logits.new_ones((wrong_logits.size(0),))
-            loss = loss_func(correct_logits, wrong_logits, y)  # margin ranking loss
-        elif args.loss == 'cross_entropy':
-            loss = loss_func(logits, labels)
-        return loss
-
     ###################################################################################################
     #   Training                                                                                      #
     ###################################################################################################
 
     print()
     print('-' * 71)
-    if args.fp16:
-        print ('Using fp16 training')
-        scaler = torch.cuda.amp.GradScaler()
-
     global_step, best_dev_epoch = 0, 0
     best_dev_acc, final_test_acc, total_loss = 0.0, 0.0, 0.0
     start_time = time.time()
@@ -251,31 +224,25 @@ def train(args):
                 bs = labels.size(0)
                 for a in range(0, bs, args.mini_batch_size):
                     b = min(a + args.mini_batch_size, bs)
-                    if args.fp16:
-                        with torch.cuda.amp.autocast():
-                            logits, _ = model(*[x[a:b] for x in input_data], layer_id=args.encoder_layer)
-                            loss = compute_loss(logits, labels[a:b])
-                    else:
-                        logits, _ = model(*[x[a:b] for x in input_data], layer_id=args.encoder_layer)
-                        loss = compute_loss(logits, labels[a:b])
+                    logits, _ = model(*[x[a:b] for x in input_data], layer_id=args.encoder_layer)
+
+                    if args.loss == 'margin_rank':
+                        num_choice = logits.size(1)
+                        flat_logits = logits.view(-1)
+                        correct_mask = F.one_hot(labels, num_classes=num_choice).view(-1)  # of length batch_size*num_choice
+                        correct_logits = flat_logits[correct_mask == 1].contiguous().view(-1, 1).expand(-1, num_choice - 1).contiguous().view(-1)  # of length batch_size*(num_choice-1)
+                        wrong_logits = flat_logits[correct_mask == 0]
+                        y = wrong_logits.new_ones((wrong_logits.size(0),))
+                        loss = loss_func(correct_logits, wrong_logits, y)  # margin ranking loss
+                    elif args.loss == 'cross_entropy':
+                        loss = loss_func(logits, labels[a:b])
                     loss = loss * (b - a) / bs
-                    if args.fp16:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                    loss.backward()
                     total_loss += loss.item()
                 if args.max_grad_norm > 0:
-                    if args.fp16:
-                        scaler.unscale_(optimizer)
-                        nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    else:
-                        nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 scheduler.step()
-                if args.fp16:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
+                optimizer.step()
 
                 if (global_step + 1) % args.log_interval == 0:
                     total_loss /= args.log_interval
@@ -319,18 +286,18 @@ def train(args):
                 final_test_acc = test_acc
                 best_dev_epoch = epoch_id
                 if args.save_model:
-                    torch.save([model.state_dict(), args], f"{model_path}.{epoch_id}")
-                    # with open(model_path +".{}.log.txt".format(epoch_id), 'w') as f:
-                    #     for p in model.named_parameters():
-                    #         print (p, file=f)
-                    print(f'model saved to {model_path}.{epoch_id}')
+                    torch.save([model, args], model_path)
+                    with open(model_path +".{}.log.txt".format(epoch_id), 'w') as f:
+                        for p in model.named_parameters():
+                            print (p, file=f)
+                    print(f'model saved to {model_path}')
             else:
                 if args.save_model:
-                    torch.save([model.state_dict(), args], f"{model_path}.{epoch_id}")
-                    # with open(model_path +".{}.log.txt".format(epoch_id), 'w') as f:
-                    #     for p in model.named_parameters():
-                    #         print (p, file=f)
-                    print(f'model saved to {model_path}.{epoch_id}')
+                    torch.save([model, args], model_path)
+                    with open(model_path +".{}.log.txt".format(epoch_id), 'w') as f:
+                        for p in model.named_parameters():
+                            print (p, file=f)
+                    print(f'model saved to {model_path}')
             model.train()
             start_time = time.time()
             if epoch_id > args.unfreeze_epoch and epoch_id - best_dev_epoch >= args.max_epochs_before_stop:
@@ -343,23 +310,7 @@ def train(args):
 def eval_detail(args):
     assert args.load_model_path is not None
     model_path = args.load_model_path
-
-    cp_emb = [np.load(path) for path in args.ent_emb_paths]
-    cp_emb = torch.tensor(np.concatenate(cp_emb, 1), dtype=torch.float)
-    concept_num, concept_dim = cp_emb.size(0), cp_emb.size(1)
-    print('| num_concepts: {} |'.format(concept_num))
-
-    model_state_dict, old_args = torch.load(model_path, map_location=torch.device('cpu'))
-    model = LM_QAGNN(old_args, old_args.encoder, k=old_args.k, n_ntype=4, n_etype=old_args.num_relation, n_concept=concept_num,
-                               concept_dim=old_args.gnn_dim,
-                               concept_in_dim=concept_dim,
-                               n_attention_head=old_args.att_head_num, fc_dim=old_args.fc_dim, n_fc_layer=old_args.fc_layer_num,
-                               p_emb=old_args.dropouti, p_gnn=old_args.dropoutg, p_fc=old_args.dropoutf,
-                               pretrained_concept_emb=cp_emb, freeze_ent_emb=old_args.freeze_ent_emb,
-                               init_range=old_args.init_range,
-                               encoder_config={})
-    model.load_state_dict(model_state_dict)
-
+    model, old_args = torch.load(model_path)
     if torch.cuda.device_count() >= 2 and args.cuda:
         device0 = torch.device("cuda:0")
         device1 = torch.device("cuda:1")
@@ -399,8 +350,6 @@ def eval_detail(args):
                                            subsample=args.subsample, use_cache=args.use_cache)
 
     save_test_preds = args.save_model
-    dev_acc = evaluate_accuracy(dataset.dev(), model)
-    print('dev_acc {:7.4f}'.format(dev_acc))
     if not save_test_preds:
         test_acc = evaluate_accuracy(dataset.test(), model) if args.test_statements else 0.0
     else:

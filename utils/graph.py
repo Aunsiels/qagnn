@@ -26,6 +26,10 @@ cpnet_all = None
 cpnet_simple = None
 
 
+RELATED_TO = merged_relations.index("relatedto")
+INV_RELATED_TO = RELATED_TO + len(merged_relations)
+
+
 def load_resources(cpnet_vocab_path):
     global concept2id, id2concept, relation2id, id2relation
 
@@ -125,7 +129,10 @@ def concepts2adj(node_ids):
                     if e_attr['rel'] >= 0 and e_attr['rel'] < n_rel:
                         adj[e_attr['rel']][s][t] = 1
     # cids += 1  # note!!! index 0 is reserved for padding
-    adj = coo_matrix(adj.reshape(-1, n_node))
+    if n_node != 0:
+        adj = coo_matrix(adj.reshape(-1, n_node))
+    else:
+        adj = coo_matrix((0, 0))
     return adj, cids
 
 
@@ -153,7 +160,7 @@ def concepts_to_adj_matrices_1hop_neighbours_without_relatedto(data):
         if u in cpnet.nodes:
             for v in cpnet[u]:
                 for data in cpnet[u][v].values():
-                    if data['rel'] not in (15, 32):
+                    if data['rel'] not in (RELATED_TO, INV_RELATED_TO):
                         extra_nodes.add(v)
     extra_nodes = extra_nodes - qa_nodes
     schema_graph = sorted(qc_ids) + sorted(ac_ids) + sorted(extra_nodes)

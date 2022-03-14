@@ -2,7 +2,7 @@ import pickle
 import os
 import numpy as np
 import torch
-from transformers import (OpenAIGPTTokenizer, BertTokenizer, XLNetTokenizer, RobertaTokenizer, AutoTokenizer)
+from transformers import (OpenAIGPTTokenizer, BertTokenizer, XLNetTokenizer, RobertaTokenizer)
 try:
     from transformers import AlbertTokenizer
 except:
@@ -15,10 +15,8 @@ GPT_SPECIAL_TOKENS = ['_start_', '_delimiter_', '_classify_']
 
 
 class MultiGPUSparseAdjDataBatchGenerator(object):
-    def __init__(self, args, mode, device0, device1, batch_size, indexes, qids, labels,
+    def __init__(self, device0, device1, batch_size, indexes, qids, labels,
                  tensors0=[], lists0=[], tensors1=[], lists1=[], adj_data=None):
-        self.args = args
-        self.mode = mode
         self.device0 = device0
         self.device1 = device1
         self.batch_size = batch_size
@@ -38,18 +36,6 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
     def __iter__(self):
         bs = self.batch_size
         n = self.indexes.size(0)
-        if self.mode=='train' and self.args.drop_partial_batch:
-            print ('dropping partial batch')
-            n = (n//bs) *bs
-        elif self.mode=='train' and self.args.fill_partial_batch:
-            print ('filling partial batch')
-            remain = n % bs
-            if remain > 0:
-                extra = np.random.choice(self.indexes[:-remain], size=(bs-remain), replace=False)
-                self.indexes = torch.cat([self.indexes, torch.tensor(extra)])
-                n = self.indexes.size(0)
-                assert n % bs == 0
-
         for a in range(0, n, bs):
             b = min(n, a + bs)
             batch_indexes = self.indexes[a:b]
@@ -78,7 +64,7 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
 
 def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice, args):
     cache_path = adj_pk_path +'.loaded_cache'
-    use_cache = True
+    use_cache = False
 
     if use_cache and not os.path.exists(cache_path):
         use_cache = False
@@ -107,7 +93,7 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
             assert len(concepts) == len(set(concepts))
             qam = qm | am
             #sanity check: should be T,..,T,F,F,..F
-            assert qam[0] == True
+            assert len(qam) == 0 or qam[0] == True
             F_start = False
             for TF in qam:
                 if TF == False:
@@ -128,7 +114,7 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
                 for _j_ in range(num_concept):
                     _cid = int(concept_ids[idx, _j_]) - 1
                     assert _cid in cid2score
-                    node_scores[idx, _j_, 0] = torch.tensor(cid2score[_cid])
+                node_scores[idx, _j_, 0] = torch.tensor(cid2score[_cid])
 
             #Prepare node types
             node_type_ids[idx, 0] = 3 #contextnode
@@ -139,8 +125,12 @@ def load_sparse_adj_data_with_contextnode(adj_pk_path, max_node_num, num_choice,
             ij = torch.tensor(adj.row, dtype=torch.int64) #(num_matrix_entries, ), where each entry is coordinate
             k = torch.tensor(adj.col, dtype=torch.int64)  #(num_matrix_entries, ), where each entry is coordinate
             n_node = adj.shape[1]
-            half_n_rel = adj.shape[0] // n_node
-            i, j = ij // n_node, ij % n_node
+            if n_node != 0:
+                half_n_rel = adj.shape[0] // n_node
+                i, j = ij // n_node, ij % n_node
+            else:
+                half_n_rel = 0
+                i, j = ij, ij
 
             #Prepare edges
             i += 2; j += 1; k += 1  # **** increment coordinate by 1, rel_id by 2 ****
@@ -348,7 +338,7 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
         label_map = {label: i for i, label in enumerate(label_list)}
 
         features = []
-        for ex_index, example in enumerate(tqdm(examples)):
+        for ex_index, example in enumerate(examples):
             choices_features = []
             for ending_idx, (context, ending) in enumerate(zip(example.contexts, example.endings)):
                 tokens_a = tokenizer.tokenize(context)
@@ -453,11 +443,10 @@ def load_bert_xlnet_roberta_input_tensors(statement_jsonl_path, model_type, mode
         all_label = torch.tensor([f.label for f in features], dtype=torch.long)
         return all_input_ids, all_input_mask, all_segment_ids, all_output_mask, all_label
 
-    # try:
-    #     tokenizer_class = {'bert': BertTokenizer, 'xlnet': XLNetTokenizer, 'roberta': RobertaTokenizer, 'albert': AlbertTokenizer}.get(model_type)
-    # except:
-    #     tokenizer_class = {'bert': BertTokenizer, 'xlnet': XLNetTokenizer, 'roberta': RobertaTokenizer}.get(model_type)
-    tokenizer_class = AutoTokenizer
+    try:
+        tokenizer_class = {'bert': BertTokenizer, 'xlnet': XLNetTokenizer, 'roberta': RobertaTokenizer, 'albert': AlbertTokenizer}.get(model_type)
+    except:
+        tokenizer_class = {'bert': BertTokenizer, 'xlnet': XLNetTokenizer, 'roberta': RobertaTokenizer}.get(model_type)
     tokenizer = tokenizer_class.from_pretrained(model_name)
     examples = read_examples(statement_jsonl_path)
     features = convert_examples_to_features(examples, list(range(len(examples[0].endings))), max_seq_length, tokenizer,
